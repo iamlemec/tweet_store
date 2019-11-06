@@ -5,9 +5,17 @@ import time
 import json
 import twitter
 import sqlite3
+import pandas as pd
 
 RATE_LIMIT = 15
 RATE_WINDOW = 15
+MAX_COUNT = 200
+
+default = {
+    'include_rts': False,
+    'exclude_replies': True,
+    'trim_user': True
+}
 
 class TweetStore:
     def __init__(self, handle, db, table='tweet', auth=None):
@@ -20,7 +28,7 @@ class TweetStore:
             self.init_db()
 
         if auth is None:
-            auth = os.path.join('creds', '%s.json' % handle)
+            auth = f'creds/{handle}.json'
         with open(auth) as f:
             creds = json.load(f)
         self.api = twitter.Api(**creds)
@@ -30,51 +38,56 @@ class TweetStore:
 
     def init_db(self):
         cur = self.con.cursor()
-        cur.execute('create table if not exists %s (id int, created int, handle text, body text)' % self.table)
-        cur.execute('create unique index if not exists tid on %s (id)' % self.table)
+        cur.execute(f'create table if not exists {self.table} (id int, created int, handle text, body text)')
+        cur.execute(f'create unique index if not exists tid on {self.table} (id)')
         self.con.commit()
 
-    def sync_batch(self, when='newest'):
+    def sync_batch(self, when='newest', **kwargs):
         cur = self.con.cursor()
 
-        (min_id, max_id) = cur.execute('select min(id),max(id) from %s' % self.table).fetchone()
+        min_id, max_id = cur.execute(f'select min(id),max(id) from {self.table}').fetchone()
         if when == 'newest':
-            args = {'since_id': max_id}
+            iargs = {'since_id': max_id}
+        elif when == 'oldest':
+            iargs = {'max_id': min_id - 1 if min_id is not None else None}
         else:
-            args = {'max_id': min_id - 1 if min_id is not None else None}
-        stats = self.api.GetUserTimeline(screen_name=self.handle, include_rts=False, exclude_replies=True,
-                                         trim_user=True, count=200, **args)
+            iargs = {}
+
+        args = {**default, **iargs, **kwargs}
+        stats = self.api.GetUserTimeline(screen_name=self.handle, count=MAX_COUNT, **args)
         nrets = len(stats)
 
-        print('Fetched %d %s tweets' % (nrets, when))
+        print(f'Fetched {nrets} {when} tweets')
         if nrets == 0:
             return 0
 
-        cur.executemany('insert or replace into %s values (?,?,?,?)' % self.table,
-            [(st.id, st.created_at_in_seconds, self.handle, st.text) for st in stats])
+        cur.executemany(
+            f'insert or replace into {self.table} values (?,?,?,?)',
+            [(st.id, st.created_at_in_seconds, self.handle, st.text) for st in stats]
+        )
         self.con.commit()
 
         return nrets
 
-    def sync_window(self, when=None):
+    def sync_window(self, when=None, **kwargs):
         done_old = (when == 'newest')
         done_new = (when == 'oldest')
         for i in range(RATE_LIMIT):
             if not done_old:
-                nrets = self.sync_batch(when='oldest')
+                nrets = self.sync_batch(when='oldest', **kwargs)
                 if nrets == 0:
                     done_old = True
             if not done_new:
-                nrets = self.sync_batch(when='newest')
+                nrets = self.sync_batch(when='newest', **kwargs)
                 if nrets == 0:
                     done_new = True
             if done_old and done_new:
                 return True
         return False
 
-    def sync(self):
+    def sync(self, **kwargs):
         while True:
-            if self.sync_window():
+            if self.sync_window(**kwargs):
                 break
             time.sleep(60*RATE_WINDOW)
 
@@ -84,22 +97,26 @@ class TweetView:
 
         if not os.path.exists(db):
             raise('Database does not exist')
+
         self.con = sqlite3.connect(db)
 
     def __del__(self):
         self.con.close()
 
-    def fetch(self):
+    def fetch(self, limit=None):
+        ltxt = f'{limit}' if limit is not None else ''
         cur = self.con.cursor()
-        cur.execute('select * from %s' % self.table)
+        cur.execute(f'select * from {self.table} {ltxt}')
         return cur
 
-    def fetchmany(self, limit=10):
-        cur = self.con.cursor()
-        cur.execute('select * from %s limit %d' % (self.table, limit))
-        return cur.fetchall()
+    def fetch_many(self, limit=10):
+        return cur.fetch(limit=limit).fetchall()
 
-    def fetchall(self):
-        cur = self.con.cursor()
-        cur.execute('select * from %s' % self.table)
-        return cur.fetchall()
+    def fetch_all(self):
+        return self.fetch().fetchall()
+
+    def fetch_frame(self, limit=None):
+        tweets = self.fetch_all()
+        df = pd.DataFrame(tweets, columns=['id', 'ts', 'handle', 'text'])
+        df['time'] = pd.to_datetime(df['ts'], unit='s')
+        return df[['id', 'handle', 'time', 'text']].set_index('id')
