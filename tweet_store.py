@@ -120,3 +120,8 @@ class TweetView:
         df = pd.DataFrame(tweets, columns=['id', 'ts', 'handle', 'text'])
         df['time'] = pd.to_datetime(df['ts'], unit='s')
         return df[['id', 'handle', 'time', 'text']].set_index('id')
+
+def export(db, csv, table='tweet'):
+    tv = TweetView(db, table=table)
+    df = tv.fetch_frame()
+    df.to_csv(csv)
